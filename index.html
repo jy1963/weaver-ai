@@ -884,7 +884,8 @@ function toast(msg, type, ms) {
   el.className = 'toast ' + (type || 'info');
   el.innerHTML = (type === 'ok' ? '✅ ' : type === 'err' ? '⚠️ ' : type === 'warn' ? '💡 ' : '') + esc(msg);
   root.appendChild(el);
-  requestAnimationFrame(() => el.classList.add('show'));
+  void el.offsetWidth;
+  el.classList.add('show');
   setTimeout(() => { el.classList.remove('show'); setTimeout(() => el.remove(), 300); }, ms || 2600);
 }
 
@@ -931,7 +932,9 @@ function modal(opts) {
     ov.addEventListener('mousedown', e => { if (e.target === ov && o.backdropClose !== false) close(); });
   }
   document.getElementById('modalRoot').appendChild(ov);
-  requestAnimationFrame(() => ov.classList.add('show'));
+  /* 不用 rAF（后台标签页会暂停 rAF 导致弹窗永不显示）：强制 reflow 后同步加 show，动画照常 */
+  void ov.offsetWidth;
+  ov.classList.add('show');
   openModals.push(api);
   document.body.classList.add('modal-open');
   const first = $('input, textarea, select', bodyEl);
@@ -1001,7 +1004,8 @@ function sheet(title, items) {
       close(it.value !== undefined ? it.value : it);
     });
     document.body.appendChild(ov);
-    requestAnimationFrame(() => ov.classList.add('show'));
+    void ov.offsetWidth;
+    ov.classList.add('show');
   });
 }
 
@@ -1433,15 +1437,15 @@ const Vault = {
   async unlock(password) {
     if (!Vault.ring) throw new Error('尚未设置主密码');
     const salt = fromB64(Vault.ring.salt);
-    let plain;
+    let key, plain;
     try {
-      const key = await Vault._derive(password, salt, Vault.ring.iterations || ITER);
+      key = await Vault._derive(password, salt, Vault.ring.iterations || ITER);
       plain = await Vault._dec(key, Vault.ring.verifier);
     } catch (e) {
       throw new Error('主密码错误');
     }
     if (plain !== CHECK_PLAIN) throw new Error('主密码错误');
-    Vault._key = await Vault._derive(password, salt, Vault.ring.iterations || ITER);
+    Vault._key = key;
     return true;
   },
 
@@ -1581,23 +1585,41 @@ function typeLabel(t) { return { openai: 'OpenAI 兼容', anthropic: 'Claude', g
 
 function isGpt5OrO(model) { return /^(o[1345](-|$)|gpt-5)/.test(model || ''); }
 
+/* ---------- 消息规范化（Anthropic/Gemini 要求首条 user、角色交替） ---------- */
+/* 返回 { system, messages }：合并连续同角色消息；若首条是 assistant，折入 system 作为剧情上下文 */
+function normalizeForClaudeOrGemini(system, messages) {
+  const merged = [];
+  for (const m of messages) {
+    const last = merged[merged.length - 1];
+    if (last && last.role === m.role) last.content += '\n\n' + m.content;
+    else merged.push({ role: m.role, content: m.content });
+  }
+  let sys = system || '';
+  while (merged.length && merged[0].role === 'assistant') {
+    const a = merged.shift();
+    sys += (sys ? '\n\n' : '') + `【剧情开场（你此前已说过的话，作为上下文）】\n${a.content}`;
+  }
+  return { system: sys || undefined, messages: merged };
+}
+
 /* ---------- 构造请求体 ---------- */
 function buildRequest(cfg, opts) {
-  const { system, messages, params, stream } = opts;
-  const p = params || {};
+  const { system, messages, stream } = opts;
+  const p = opts.params || {};
   const model = cfg.model || cfg.defaultModel || '';
 
   if (cfg.type === 'anthropic') {
+    const norm = normalizeForClaudeOrGemini(system, messages);
     const thinkingOn = p.thinking && p.thinking !== 'off';
     let maxTokens = Math.max(16, p.maxTokens || 4096);
     if (thinkingOn) maxTokens = Math.max(maxTokens, 2048) + 4096; /* 思考 token 需计入上限 */
     const body = {
       model,
       max_tokens: maxTokens,
-      messages: messages.map(m => ({ role: m.role, content: m.content })),
+      messages: norm.messages.map(m => ({ role: m.role, content: m.content })),
       stream: !!stream,
     };
-    if (system) body.system = system;
+    if (norm.system) body.system = norm.system;
     if (thinkingOn) {
       const budget = { low: 2048, medium: 8192, high: 16384 }[p.thinking] || (parseInt(p.thinking, 10) || 8192);
       body.thinking = { type: 'enabled', budget_tokens: Math.max(1024, budget) };
@@ -1615,6 +1637,7 @@ function buildRequest(cfg, opts) {
   }
 
   if (cfg.type === 'gemini') {
+    const norm = normalizeForClaudeOrGemini(system, messages);
     const gc = {};
     if (p.temperature != null) gc.temperature = p.temperature;
     if (p.topP != null) gc.topP = p.topP;
@@ -1627,9 +1650,9 @@ function buildRequest(cfg, opts) {
     } else if (th === 'off' && /flash/.test(model)) {
       gc.thinkingConfig = { thinkingBudget: 0 };
     }
-    const contents = messages.map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] }));
+    const contents = norm.messages.map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] }));
     const body = { contents };
-    if (system) body.systemInstruction = { parts: [{ text: system }] };
+    if (norm.system) body.systemInstruction = { parts: [{ text: norm.system }] };
     if (Object.keys(gc).length) body.generationConfig = gc;
     const url = cfg.baseURL.replace(/\/$/, '') + '/models/' + encodeURIComponent(model) +
       (stream ? ':streamGenerateContent?alt=sse' : ':generateContent');
@@ -2341,12 +2364,12 @@ function gc(s) {
 }
 
 /* ================= 上下文组装（总结 + 记忆） ================= */
-function analyzeContext(s, excludeId) {
+function analyzeContext(s, excludeId, systemReserve) {
   const br = activeBranch(s);
   const path = pathOf(s, br.tipId).filter(m => m.role !== 'system');
   const usable = path.filter(m => m.id !== excludeId && contentOf(m));
   const p = effParams(s);
-  const budget = Math.max(1000, p.contextTokens - (p.maxTokens || 2048) - 400);
+  const budget = Math.max(600, p.contextTokens - (p.maxTokens || 2048) - 400 - (systemReserve || 0));
   let used = 0, keepFrom = usable.length;
   for (let i = usable.length - 1; i >= 0; i--) {
     const t = estimateTokens(contentOf(usable[i])) + 8;
@@ -2361,19 +2384,24 @@ function analyzeContext(s, excludeId) {
 }
 
 function buildPrompt(s, excludeId) {
-  const a = analyzeContext(s, excludeId);
   const p = effParams(s);
-  const lastUser = [...a.kept].reverse().find(m => m.role === 'user') || [...a.usable].reverse().find(m => m.role === 'user');
   const mem = memStore(s);
-  const recent = lastUser ? contentOf(lastUser) : '';
+  /* 先组装静态 system（人设+破甲+永久记忆+剧情回顾），估算其占用后再裁剪历史 */
+  const staticParts = [];
+  if (s.systemPrompt && s.systemPrompt.trim()) staticParts.push(s.systemPrompt.trim());
+  if (p.antiCensor) staticParts.push(ANTI_CENSOR);
   const perm = Mem.permBlock(mem.pm || []);
+  if (perm) staticParts.push(perm);
+  if (s.digest && s.digest.text) staticParts.push(Mem.digestBlock(s.digest.text));
+  const staticSys = staticParts.join('\n\n');
+  const reserve = staticSys ? estimateTokens(staticSys) : 0;
+
+  const a = analyzeContext(s, excludeId, reserve);
+  const lastUser = [...a.kept].reverse().find(m => m.role === 'user') || [...a.usable].reverse().find(m => m.role === 'user');
+  const recent = lastUser ? contentOf(lastUser) : '';
   const ltm = Mem.assocBlock('长期记忆', Mem.retrieve(mem.ltm || [], recent, S.settings.memoryTopK));
   const stm = Mem.assocBlock('近期记忆', Mem.retrieve(mem.stm || [], recent, S.settings.memoryTopK));
-  const parts = [];
-  if (s.systemPrompt && s.systemPrompt.trim()) parts.push(s.systemPrompt.trim());
-  if (effParams(s).antiCensor) parts.push(ANTI_CENSOR);
-  if (perm) parts.push(perm);
-  if (s.digest && s.digest.text) parts.push(Mem.digestBlock(s.digest.text));
+  const parts = staticParts.slice();
   if (ltm) parts.push(ltm);
   if (stm) parts.push(stm);
   const system = parts.length ? parts.join('\n\n') : undefined;
@@ -2899,6 +2927,8 @@ async function deleteMessage(s, id) {
 
 function editMessage(s, id) {
   const node = s.messages[id]; if (!node) return;
+  /* 编辑态单例：先关闭其他已打开的编辑框，避免多个编辑区互相干扰 */
+  if (document.querySelector('.edit-area')) { renderChat(); }
   const refs = getMsgRefs(id); if (!refs) return;
   const old = contentOf(node);
   const hasChildren = Object.values(s.messages).some(m => m.parentId === id);
@@ -3845,7 +3875,7 @@ function updateSendBtn() {
 }
 
 /* ================= 侧栏开合（移动端抽屉） ================= */
-function openSidebar() { $('#sidebar').classList.add('open'); $('#backdrop').hidden = false; requestAnimationFrame(() => $('#backdrop').classList.add('show')); }
+function openSidebar() { $('#sidebar').classList.add('open'); $('#backdrop').hidden = false; const bd = $('#backdrop'); void bd.offsetWidth; bd.classList.add('show'); }
 function closeSidebar() { $('#sidebar').classList.remove('open'); const bd = $('#backdrop'); bd.classList.remove('show'); setTimeout(() => { bd.hidden = true; }, 200); }
 function isMobileLayout() { return window.matchMedia('(max-width: 860px)').matches; }
 
