@@ -2368,6 +2368,88 @@ window.Cards = { Cards, blanks, toSystemPrompt, randomCard, aiGenerate, ROOT: CH
 })();
 
 
+/* 织语 AI - 世界书（Lorebook）
+ * 关键词触发的世界观设定库：每条设定带一组触发关键词，
+ * 当对话内容命中关键词时，该设定被自动注入 system，让 AI 严格遵循世界观。
+ * 数据存 IndexedDB lorebook 表（全局库，跨会话复用），内存缓存同步更新。
+ */
+(function () {
+'use strict';
+
+const STORE = 'lorebook';
+
+function blank() {
+  const now = Date.now();
+  return {
+    id: U.uid(), title: '', keywords: [], content: '',
+    enabled: true, priority: 2, createdAt: now, updatedAt: now,
+  };
+}
+
+function parseKeywords(s) {
+  return String(s || '').split(/[,，、;；\s]+/).map(x => x.trim()).filter(Boolean).slice(0, 20);
+}
+
+const Lore = {
+  cache: [],
+
+  async load() {
+    try {
+      const arr = await DB.all(STORE);
+      arr.sort((a, b) => (b.priority || 2) - (a.priority || 2) || (b.updatedAt - a.updatedAt));
+      Lore.cache = arr;
+    } catch (e) { console.warn('世界书加载失败', e); Lore.cache = []; }
+    return Lore.cache;
+  },
+
+  async put(entry) {
+    entry.updatedAt = Date.now();
+    if (!Array.isArray(entry.keywords)) entry.keywords = parseKeywords(entry.keywords);
+    await DB.put(STORE, entry);
+    const i = Lore.cache.findIndex(x => x.id === entry.id);
+    if (i >= 0) Lore.cache[i] = entry; else Lore.cache.push(entry);
+    Lore.cache.sort((a, b) => (b.priority || 2) - (a.priority || 2) || (b.updatedAt - a.updatedAt));
+    return entry;
+  },
+
+  async del(id) {
+    await DB.del(STORE, id);
+    Lore.cache = Lore.cache.filter(x => x.id !== id);
+  },
+
+  enabledCount() { return Lore.cache.filter(e => e.enabled !== false).length; },
+
+  /* 关键词匹配：在 text 中命中任一关键词即触发；命中越多/关键词越长分越高 */
+  match(text, topK) {
+    const t = String(text || '');
+    if (!t) return [];
+    const hits = [];
+    for (const e of Lore.cache) {
+      if (e.enabled === false) continue;
+      let score = 0;
+      for (const k of (e.keywords || [])) {
+        if (k && t.includes(k)) score += k.length >= 3 ? 3 : 2;
+      }
+      if (score > 0) hits.push({ e, score: score + (e.priority || 2) });
+    }
+    hits.sort((a, b) => b.score - a.score);
+    return hits.slice(0, topK || 8).map(h => h.e);
+  },
+
+  /* 组装注入块 */
+  block(selected) {
+    if (!selected || !selected.length) return '';
+    const lines = selected.map(e => (e.title ? `◆ ${e.title}：${e.content}` : `◆ ${e.content}`));
+    return `【世界设定 · 由剧情关键词触发】\n以下设定与当前剧情直接相关，请在描写中严格遵循、保持一致：\n${lines.join('\n')}`;
+  },
+
+  blank, parseKeywords,
+};
+
+window.Lore = Lore;
+})();
+
+
 /* 织语 AI - 主应用 */
 (function () {
 'use strict';
